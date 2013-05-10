@@ -99,6 +99,7 @@ static const char *algo_names[] = {
 
 bool opt_debug = false;
 bool opt_protocol = false;
+static int  opt_limit_run = 5;
 static bool opt_benchmark = false;
 bool want_longpoll = true;
 bool have_longpoll = false;
@@ -163,7 +164,8 @@ Options:\n\
       --no-longpoll     disable X-Long-Polling support\n\
   -q, --quiet           disable per-thread hashmeter output\n\
   -D, --debug           enable debug output\n\
-  -P, --protocol-dump   verbose dump of protocol-level activities\n"
+  -P, --protocol-dump   verbose dump of protocol-level activities\n\
+  -L, --limit-run=N  	run limit number of times (default: 5, min: 1, max: 50)\n"
 #ifdef HAVE_SYSLOG_H
 "\
   -S, --syslog          use system log for output messages\n"
@@ -186,7 +188,7 @@ static char const short_options[] =
 #ifdef HAVE_SYSLOG_H
 	"S"
 #endif
-	"a:c:Dhp:Px:qr:R:s:t:T:o:u:O:V";
+	"a:c:DL:hp:Px:qr:R:s:t:T:o:u:O:V";
 
 static struct option const options[] = {
 	{ "algo", 1, NULL, 'a' },
@@ -200,6 +202,7 @@ static struct option const options[] = {
 	{ "no-longpoll", 0, NULL, 1003 },
 	{ "pass", 1, NULL, 'p' },
 	{ "protocol-dump", 0, NULL, 'P' },
+	{ "limit-run", 1, NULL, 'L' },
 	{ "proxy", 1, NULL, 'x' },
 	{ "quiet", 0, NULL, 'q' },
 	{ "retries", 1, NULL, 'r' },
@@ -352,6 +355,12 @@ static bool get_upstream_work(CURL *curl, struct work *work)
 	bool rc;
 	struct timeval tv_start, tv_end, diff;
 
+	applog(LOG_DEBUG, "opt_limit_run: %d", opt_limit_run--);
+	if(-1 == opt_limit_run) {
+		applog(LOG_DEBUG, "Limit reached, returning false to workio thread");
+		return false;
+	}
+
 	gettimeofday(&tv_start, NULL);
 	val = json_rpc_call(curl, rpc_url, rpc_userpass, rpc_req,
 			    want_longpoll, false, NULL);
@@ -403,6 +412,11 @@ static bool workio_get_work(struct workio_cmd *wc, CURL *curl)
 	while (!get_upstream_work(curl, ret_work)) {
 		if (unlikely((opt_retries >= 0) && (++failures > opt_retries))) {
 			applog(LOG_ERR, "json_rpc_call failed, terminating workio thread");
+			free(ret_work);
+			return false;
+		}
+		else if(0 == opt_limit_run) {
+			applog(LOG_INFO, "Limit reached, finishing workio thread");
 			free(ret_work);
 			return false;
 		}
@@ -832,6 +846,12 @@ static void parse_arg (int key, char *arg)
 	case 'P':
 		opt_protocol = true;
 		break;
+	case 'L':
+		v = atoi(arg);
+		if (v <= 0 || v > 50)	/* sanity check */
+			show_usage_and_exit(1);
+		opt_limit_run = v;
+		break;		
 	case 'r':
 		v = atoi(arg);
 		if (v < -1 || v > 9999)	/* sanity check */
@@ -880,17 +900,14 @@ static void parse_arg (int key, char *arg)
 			rpc_url = malloc((strlen(arg) + 8) * sizeof(char));
 			sprintf(rpc_url, "http://%s", arg);
 		}
-		p = strrchr(rpc_url, '@');
+		p = strchr(rpc_url, '@');
 		if (p) {
 			char *ap = strstr(rpc_url, "://") + 3;
 			*p = '\0';
-			if (strchr(ap, ':')) {
-				free(rpc_userpass);
-				rpc_userpass = strdup(ap);
-			} else {
-				free(rpc_user);
-				rpc_user = strdup(ap);
-			}
+			if (!strchr(ap, ':'))
+				show_usage_and_exit(1);
+			free(rpc_userpass);
+			rpc_userpass = strdup(ap);
 			memmove(ap, p + 1, (strlen(p + 1) + 1) * sizeof(char));
 		}
 		break;
@@ -1008,7 +1025,7 @@ void signal_handler(int sig)
 }
 #endif
 
-int main(int argc, char *argv[])
+int cpu_miner_main(int argc, char *argv[])
 {
 	struct thr_info *thr;
 	int i;
@@ -1130,6 +1147,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
+
+	applog(LOG_INFO, "Execution is limited to %d work requests", opt_limit_run);
 
 	applog(LOG_INFO, "%d miner threads started, "
 		"using '%s' algorithm.",
